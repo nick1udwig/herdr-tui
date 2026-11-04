@@ -116,6 +116,48 @@ fn install_png_decoder() {
     });
 }
 
+/// Program copies use the same host clipboard as mouse and copy-mode selections.
+unsafe extern "C" fn on_clipboard_write(
+    _term: GhosttyTerminal,
+    _userdata: *mut c_void,
+    request: *const GhosttyClipboardWrite,
+) {
+    let request = unsafe { &*request };
+    let result = (|| {
+        if request.location != GHOSTTY_CLIPBOARD_LOCATION_STANDARD || request.contents_len > 1 {
+            return Err(GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED);
+        }
+        let text = if request.contents_len == 0 {
+            ""
+        } else {
+            let content = unsafe { &*request.contents };
+            if content.mime.len != b"text/plain".len()
+                || unsafe { std::slice::from_raw_parts(content.mime.ptr, content.mime.len) }
+                    != b"text/plain"
+            {
+                return Err(GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED);
+            }
+            let bytes = if content.data.len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(content.data.ptr, content.data.len) }
+            };
+            std::str::from_utf8(bytes).map_err(|_| GHOSTTY_CLIPBOARD_WRITE_RESULT_INVALID_DATA)?
+        };
+        crate::clipboard::copy(text).map_err(|_| GHOSTTY_CLIPBOARD_WRITE_RESULT_IO_ERROR)
+    })();
+    if let Some(reply) = request.reply {
+        let status = GhosttyClipboardWriteReply {
+            size: std::mem::size_of::<GhosttyClipboardWriteReply>(),
+            result: result
+                .err()
+                .unwrap_or(GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS),
+            remember: false,
+        };
+        unsafe { reply(request, &status) };
+    }
+}
+
 /// Synchronized output (mode 2026), copied from herdr-app: when a program
 /// starts drawing a frame, the render state keeps its finished frame until it ends.
 struct Hold {
@@ -197,6 +239,15 @@ impl Vt {
                 vt.term,
                 GHOSTTY_TERMINAL_OPT_RENDER_HOLD,
                 std::mem::transmute::<GhosttyTerminalRenderHoldFn, *const c_void>(callback),
+            );
+            let callback: GhosttyTerminalClipboardWriteFn = Some(on_clipboard_write);
+            ok(
+                ghostty_terminal_set(
+                    vt.term,
+                    GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+                    std::mem::transmute::<GhosttyTerminalClipboardWriteFn, *const c_void>(callback),
+                ),
+                "clipboard write callback",
             );
             ok(
                 ghostty_render_state_row_iterator_new(std::ptr::null(), &mut vt.rows_it),

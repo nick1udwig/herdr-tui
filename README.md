@@ -97,6 +97,7 @@ The mouse wheel scrolls history when the program does not use mouse reporting.
 In copy mode, use h/j/k/l and w/b/e to move, v or Space to select, and y or Enter to copy.
 Use PageUp and PageDown for history, / to search retained history, n to repeat, and q or Esc to leave.
 Copies go through `wl-copy`, `xclip`, `xsel`, or `pbcopy`, else OSC 52; over SSH, in VS Code, or in WSL, OSC 52 comes first.
+Programs inside a pane can also copy text to the host clipboard with OSC 52.
 In a terminal on another machine, ctrl+v (`remote_image_paste`) or an empty paste sends the clipboard image there, and a pasted image file path sends that file; its path is pasted in.
 Paste through the host terminal's paste command.
 
