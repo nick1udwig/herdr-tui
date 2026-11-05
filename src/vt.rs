@@ -1,5 +1,6 @@
 //! Terminal parsing, cell extraction, and input encoding adapted from herdr-app.
 use ghostty_sys::*;
+use ratatui::style::Color;
 use std::{ffi::c_void, sync::Arc};
 const BRACKETED_PASTE: GhosttyMode = 2004;
 const SYNC_OUTPUT: GhosttyMode = 2026;
@@ -18,16 +19,15 @@ impl From<GhosttyColorRgb> for Rgb {
 pub struct Cell {
     /// Empty for blank cells and for the tail half of a wide character.
     pub text: String,
-    pub fg: Rgb,
-    pub bg: Option<Rgb>,
+    pub fg: Color,
+    pub bg: Color,
     pub bold: bool,
     pub italic: bool,
     pub faint: bool,
     pub underline: bool,
     pub strike: bool,
     pub wide: bool,
-    /// The foreground is the terminal's default, drawn in the host's own color.
-    pub default_fg: bool,
+    pub inverse: bool,
 }
 
 #[derive(Clone)]
@@ -140,6 +140,7 @@ pub struct Vt {
     clear_pending: bool,
     cached_rows: Vec<Arc<Vec<Cell>>>,
     cached_colors: Option<(Rgb, Rgb, u16, u16)>,
+    default_colors: GhosttyRenderStateColors,
     term: GhosttyTerminal,
     state: GhosttyRenderState,
     rows_it: GhosttyRenderStateRowIterator,
@@ -166,6 +167,10 @@ impl Vt {
                 clear_pending: false,
                 cached_rows: Vec::new(),
                 cached_colors: None,
+                default_colors: GhosttyRenderStateColors {
+                    size: std::mem::size_of::<GhosttyRenderStateColors>(),
+                    ..Default::default()
+                },
                 term: std::ptr::null_mut(),
                 state: std::ptr::null_mut(),
                 rows_it: std::ptr::null_mut(),
@@ -244,6 +249,25 @@ impl Vt {
                 ),
                 "scrollback limit",
             );
+            ghostty_render_state_update(vt.state, vt.term);
+            ghostty_render_state_get(
+                vt.state,
+                GHOSTTY_RENDER_STATE_DATA_COLORS,
+                &mut vt.default_colors as *mut _ as *mut c_void,
+            );
+            // Give OSC 110/111 a default to restore after a program changes its colors.
+            for (option, color) in [
+                (
+                    GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
+                    vt.default_colors.foreground,
+                ),
+                (
+                    GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND,
+                    vt.default_colors.background,
+                ),
+            ] {
+                ghostty_terminal_set(vt.term, option, &color as *const _ as *const c_void);
+            }
             vt
         }
     }
@@ -605,7 +629,7 @@ impl Vt {
                 );
                 let mut row = Vec::with_capacity(self.cols as usize);
                 while ghostty_render_state_row_cells_next(self.cells) {
-                    row.push(self.read_cell(colors.foreground.into(), colors.background.into()));
+                    row.push(self.read_cell(&colors));
                 }
                 self.cached_rows[y as usize] = Arc::new(row);
                 if full {
@@ -629,11 +653,11 @@ impl Vt {
                     .then_some((cursor.viewport_x, cursor.viewport_y)),
                 bg: colors.background.into(),
             };
-            self.paint_images(&mut frame);
+            self.paint_images(&mut frame, &colors);
             frame
         }
     }
-    fn paint_images(&self, frame: &mut Frame) {
+    fn paint_images(&self, frame: &mut Frame, colors: &GhosttyRenderStateColors) {
         for placement in self.placements() {
             let Some((w, h, pixels)) = self.image_bgra(placement.image, placement.source) else {
                 continue;
@@ -662,7 +686,12 @@ impl Vt {
                         let sy = ((y * 2 + part) * h / (height * 2)).min(h - 1);
                         let i = ((sy * w + sx) * 4) as usize;
                         let alpha = u32::from(pixels[i + 3]);
-                        let bg = cell.bg.unwrap_or(frame.bg);
+                        let bg = match if cell.inverse { cell.fg } else { cell.bg } {
+                            Color::Rgb(r, g, b) => Rgb(r, g, b),
+                            Color::Indexed(index) => colors.palette[index as usize].into(),
+                            _ if cell.inverse => colors.foreground.into(),
+                            _ => frame.bg,
+                        };
                         let mix = |v: u8, b: u8| {
                             ((u32::from(v) * alpha + u32::from(b) * (255 - alpha)) / 255) as u8
                         };
@@ -676,8 +705,8 @@ impl Vt {
                     let bottom = sample(1);
                     *cell = Cell {
                         text: "▀".into(),
-                        fg: top,
-                        bg: Some(bottom),
+                        fg: Color::Rgb(top.0, top.1, top.2),
+                        bg: Color::Rgb(bottom.0, bottom.1, bottom.2),
                         ..Cell::default()
                     };
                 }
@@ -731,7 +760,37 @@ impl Vt {
             String::from_utf8(bytes[..len].to_vec()).ok()
         }
     }
-    unsafe fn read_cell(&mut self, fg_default: Rgb, bg_default: Rgb) -> Cell {
+    fn palette_color(&self, index: u8, colors: &GhosttyRenderStateColors) -> Color {
+        let color = colors.palette[index as usize];
+        if Rgb::from(color) == Rgb::from(self.default_colors.palette[index as usize]) {
+            // Keep the index so the host, rather than Ghostty's default palette, colors it.
+            Color::Indexed(index)
+        } else {
+            Color::Rgb(color.r, color.g, color.b)
+        }
+    }
+
+    fn style_color(
+        &self,
+        color: GhosttyStyleColor,
+        current: GhosttyColorRgb,
+        default: GhosttyColorRgb,
+        colors: &GhosttyRenderStateColors,
+    ) -> Color {
+        unsafe {
+            match color.tag {
+                GHOSTTY_STYLE_COLOR_PALETTE => self.palette_color(color.value.palette, colors),
+                GHOSTTY_STYLE_COLOR_RGB => {
+                    let rgb = color.value.rgb;
+                    Color::Rgb(rgb.r, rgb.g, rgb.b)
+                }
+                _ if Rgb::from(current) == Rgb::from(default) => Color::Reset,
+                _ => Color::Rgb(current.r, current.g, current.b),
+            }
+        }
+    }
+
+    unsafe fn read_cell(&mut self, colors: &GhosttyRenderStateColors) -> Cell {
         unsafe {
             let c = self.cells;
             let mut raw: GhosttyCell = Default::default();
@@ -757,30 +816,45 @@ impl Vt {
                 &mut style as *mut _ as *mut c_void,
             );
 
-            let mut fg = GhosttyColorRgb::default();
-            let explicit_fg = ghostty_render_state_row_cells_get(
-                c,
-                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
-                &mut fg as *mut _ as *mut c_void,
-            ) == GHOSTTY_SUCCESS;
-            let fg = if explicit_fg {
-                Rgb::from(fg)
-            } else {
-                fg_default
-            };
-            let mut bg = GhosttyColorRgb::default();
-            let bg = (ghostty_render_state_row_cells_get(
-                c,
-                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
-                &mut bg as *mut _ as *mut c_void,
-            ) == GHOSTTY_SUCCESS)
-                .then(|| Rgb::from(bg));
-
-            let (mut fg, mut bg) = (fg, bg);
-            if style.inverse {
-                let new_fg = bg.unwrap_or(bg_default);
-                bg = Some(fg);
-                fg = new_fg;
+            let fg = self.style_color(
+                style.fg_color,
+                colors.foreground,
+                self.default_colors.foreground,
+                colors,
+            );
+            let mut bg = self.style_color(
+                style.bg_color,
+                colors.background,
+                self.default_colors.background,
+                colors,
+            );
+            // Blank cells can store their background directly, without a style.
+            let mut content: GhosttyCellContentTag = Default::default();
+            ghostty_cell_get(
+                raw,
+                GHOSTTY_CELL_DATA_CONTENT_TAG,
+                &mut content as *mut _ as *mut c_void,
+            );
+            match content {
+                GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE => {
+                    let mut index: GhosttyColorPaletteIndex = 0;
+                    ghostty_cell_get(
+                        raw,
+                        GHOSTTY_CELL_DATA_COLOR_PALETTE,
+                        &mut index as *mut _ as *mut c_void,
+                    );
+                    bg = self.palette_color(index, colors);
+                }
+                GHOSTTY_CELL_CONTENT_BG_COLOR_RGB => {
+                    let mut rgb = GhosttyColorRgb::default();
+                    ghostty_cell_get(
+                        raw,
+                        GHOSTTY_CELL_DATA_COLOR_RGB,
+                        &mut rgb as *mut _ as *mut c_void,
+                    );
+                    bg = Color::Rgb(rgb.r, rgb.g, rgb.b);
+                }
+                _ => {}
             }
             let mut text = String::new();
             if wide != GHOSTTY_CELL_WIDE_SPACER_TAIL
@@ -821,7 +895,7 @@ impl Vt {
                 underline: style.underline != 0,
                 strike: style.strikethrough,
                 wide: wide == GHOSTTY_CELL_WIDE_WIDE,
-                default_fg: !explicit_fg && !style.inverse,
+                inverse: style.inverse,
             }
         }
     }
@@ -1051,21 +1125,22 @@ mod tests {
         vt.write(b"\x1b[2;1H\x1b_Ga=T,f=32,s=1,v=1,c=2,r=1;/wAA/w==\x1b\\");
         let frame = vt.frame();
         assert_eq!(frame.rows[1][0].text, "▀");
-        assert_eq!(frame.rows[1][0].fg, Rgb(255, 0, 0));
+        assert_eq!(frame.rows[1][0].fg, Color::Rgb(255, 0, 0));
     }
     #[test]
     fn unicode_colors_cursor_and_alternate_screen() {
         let mut vt = Vt::new(20, 4);
         vt.write(b"X");
         let initial = vt.frame();
-        assert_ne!(initial.rows[0][0].fg, initial.bg);
+        assert_eq!(initial.rows[0][0].fg, Color::Reset);
+        assert_eq!(initial.rows[0][0].bg, Color::Reset);
         vt.write(b"\r\x1b[2K");
         vt.write("\x1b[38;2;1;2;3m界e\u{301}".as_bytes());
         let frame = vt.frame();
         assert_eq!(frame.rows[0][0].text, "界");
         assert!(frame.rows[0][0].wide);
         assert_eq!(frame.rows[0][2].text, "e\u{301}");
-        assert_eq!(frame.rows[0][0].fg, Rgb(1, 2, 3));
+        assert_eq!(frame.rows[0][0].fg, Color::Rgb(1, 2, 3));
         assert_eq!(frame.cursor, Some((3, 0)));
         vt.write(b"\x1b[?1049h\x1b[HALT");
         assert!(vt.alt_screen());

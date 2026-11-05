@@ -41,15 +41,22 @@ pub struct Connection {
     pub stream: Option<Stream>,
     pub address: String,
     pub record: Terminal,
+    display: Value,
 }
 /// Attach with recent history, as Herdr shows on reattach.
-pub fn attach_params(terminal: &str, size: (u16, u16), resumed: bool) -> AttachParams {
+pub fn attach_params(
+    terminal: &str,
+    size: (u16, u16),
+    resumed: bool,
+    display: &Value,
+) -> AttachParams {
     AttachParams {
         terminal: terminal.into(),
         cols: size.0,
         rows: size.1,
         resumed,
         history: 1000,
+        display: display.clone(),
         ..Default::default()
     }
 }
@@ -59,11 +66,12 @@ impl Connection {
         target: &str,
         size: (u16, u16),
         resumed: bool,
+        display: &Value,
     ) -> Result<Self, Error> {
         let client = config.connect(DEADLINE).await?;
         let (_, events) = client.subscribe(DEADLINE).await?;
         let (record, stream) = client
-            .attach(&attach_params(target, size, resumed), DEADLINE)
+            .attach(&attach_params(target, size, resumed, display), DEADLINE)
             .await?;
         let address = Some(record.address.clone())
             .filter(|a| !a.is_empty())
@@ -74,12 +82,16 @@ impl Connection {
             stream: Some(stream),
             address,
             record,
+            display: display.clone(),
         })
     }
     pub async fn attach(&mut self, size: (u16, u16)) -> Result<(), Error> {
         let (record, stream) = self
             .client
-            .attach(&attach_params(&self.address, size, true), DEADLINE)
+            .attach(
+                &attach_params(&self.address, size, true, &self.display),
+                DEADLINE,
+            )
             .await?;
         self.record = record;
         self.stream = Some(stream);

@@ -34,6 +34,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     io::{self, stdout},
     time::{Duration, Instant},
 };
@@ -169,6 +170,7 @@ pub struct Workspace {
     git: HashMap<String, GitInfo>,
     git_poller: git::Poller,
     focused: bool,
+    display: Value,
     peek: Option<String>,
     previous_pane: Option<String>,
     copy_search: Option<CopySearch>,
@@ -631,7 +633,7 @@ impl Workspace {
                     .session
                     .client
                     .attach(
-                        &crate::connection::attach_params(&address, wanted, true),
+                        &crate::connection::attach_params(&address, wanted, true, &self.display),
                         TIME,
                     )
                     .await
@@ -983,6 +985,8 @@ pub async fn run(
     config: HcConfig,
     initial_machine: String,
     instance: Option<String>,
+    display: Value,
+    mut interrupt: impl Future<Output = io::Result<()>> + Unpin,
 ) -> Result<()> {
     let instance = instance.unwrap_or_else(|| format!("tui-{}", std::process::id()));
     let mut endpoint = crate::control::Endpoint::bind(&config.session, &instance)?;
@@ -1057,6 +1061,7 @@ pub async fn run(
         git: HashMap::new(),
         git_poller: git::Poller::default(),
         focused: true,
+        display,
         peek: None,
         previous_pane: None,
         copy_search: None,
@@ -1084,7 +1089,6 @@ pub async fn run(
     let _host = Host::enter()?;
     let mut screen = Terminal::new(CrosstermBackend::new(stdout()))?;
     let mut events = EventStream::new();
-    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     let mut dirty = true;
     // Only visible terminals printed since the last frame.
     let mut output_due = false;

@@ -15,6 +15,7 @@ build:
 
 integration: build
     python3 tests/integration_pty.py
+    python3 tests/colors.py
     python3 tests/pane_exit.py
     python3 tests/group_close.py
     python3 tests/git_polling.py

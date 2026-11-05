@@ -26,11 +26,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use herdr_client_lib::client::StreamEvent;
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    style::{Color, Modifier, Style},
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{self, stdout},
     time::Duration,
@@ -40,6 +36,23 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub static MOUSE_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 struct Host;
 impl Host {
+    fn display() -> serde_json::Value {
+        let mut options = terminal_colorsaurus::QueryOptions::default();
+        options.timeout = Duration::from_millis(500);
+        match terminal_colorsaurus::color_palette(options) {
+            Ok(colors) => {
+                let hex = |color: terminal_colorsaurus::Color| {
+                    let (r, g, b) = color.scale_to_8bit();
+                    format!("#{r:02x}{g:02x}{b:02x}")
+                };
+                serde_json::json!({
+                    "fg": hex(colors.foreground),
+                    "bg": hex(colors.background),
+                })
+            }
+            Err(_) => serde_json::Value::Null,
+        }
+    }
     fn enter() -> io::Result<Self> {
         let guard = Self;
         Self::modes()?;
@@ -109,8 +122,23 @@ async fn run() -> Result<()> {
     if cli::headless(&options).await? {
         return Ok(());
     }
+    // Install the handler before the probe temporarily changes terminal modes.
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    if let std::task::Poll::Ready(result) = futures_util::poll!(&mut interrupt) {
+        result?;
+        return Ok(());
+    }
+    // Query before EventStream owns terminal input; headless commands never probe.
+    let display = Host::display();
     if options.positional.is_empty() {
-        return workspace::run(options.config, options.machine, options.instance).await;
+        return workspace::run(
+            options.config,
+            options.machine,
+            options.instance,
+            display,
+            interrupt,
+        )
+        .await;
     }
     if options.positional.len() != 1 {
         return Err("Expected one terminal address".into());
@@ -119,7 +147,7 @@ async fn run() -> Result<()> {
     let config = options.config;
     let mut size = terminal::size()?;
     let mut connection =
-        Some(connection::Connection::connect(&config, &target, size, false).await?);
+        Some(connection::Connection::connect(&config, &target, size, false, &display).await?);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         restore();
@@ -130,7 +158,6 @@ async fn run() -> Result<()> {
     let initial_size = connection.as_ref().unwrap().size();
     let mut vt = vt::Vt::new(initial_size.0, initial_size.1);
     let mut events = EventStream::new();
-    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     let mut focused = true;
     let mut dirty = true;
     let mut repaint = connection::Repaint::default();
@@ -145,7 +172,7 @@ async fn run() -> Result<()> {
         let Some(current) = connection.as_mut() else {
             tokio::select! {
                 _=&mut interrupt=>break,
-                result=connection::Connection::connect(&config,&target,size,true)=> {
+                result=connection::Connection::connect(&config,&target,size,true,&display)=> {
                     match result {
                         Ok(new)=>{let dimensions=new.size();vt=vt::Vt::new(dimensions.0,dimensions.1);connection=Some(new);repaint.start();dirty=true;}
                         Err(_)=>{tokio::select! { _=retry.tick()=>{}, event=events.next()=>{if handle_offline(event, &mut size)? {break;}} }}
@@ -296,35 +323,7 @@ fn draw(screen: &mut Terminal<CrosstermBackend<io::Stdout>>, vt: &mut vt::Vt) ->
         let area = frame.area();
         let buffer = frame.buffer_mut();
         for (y, row) in snapshot.rows.iter().take(area.height as usize).enumerate() {
-            let mut tail = false;
-            for (x, cell) in row.iter().take(area.width as usize).enumerate() {
-                if tail {
-                    tail = false;
-                    continue;
-                }
-                let mut style = Style::default()
-                    .fg(color(cell.fg))
-                    .bg(color(cell.bg.unwrap_or(snapshot.bg)));
-                for (enabled, modifier) in [
-                    (cell.bold, Modifier::BOLD),
-                    (cell.faint, Modifier::DIM),
-                    (cell.italic, Modifier::ITALIC),
-                    (cell.underline, Modifier::UNDERLINED),
-                    (cell.strike, Modifier::CROSSED_OUT),
-                ] {
-                    if enabled {
-                        style = style.add_modifier(modifier);
-                    }
-                }
-                buffer[(x as u16, y as u16)]
-                    .set_symbol(if cell.text.is_empty() {
-                        " "
-                    } else {
-                        &cell.text
-                    })
-                    .set_style(style);
-                tail = cell.wide;
-            }
+            paint::row(buffer, area, y as u16, row, None);
         }
         if let Some((x, y)) = snapshot
             .cursor
@@ -334,7 +333,4 @@ fn draw(screen: &mut Terminal<CrosstermBackend<io::Stdout>>, vt: &mut vt::Vt) ->
         }
     })?;
     Ok(())
-}
-fn color(rgb: vt::Rgb) -> Color {
-    Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
